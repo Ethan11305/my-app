@@ -134,14 +134,14 @@ http://<VM_EXTERNAL_IP>
 - `GCP_VM_SSH_KEY`
 - `GCP_APP_DIR`
 
-## 常見問題
-### 1. SQLite 開檔失敗
+## 問題與解決
+### 1. SQLite 開檔失敗(剛開始用cloud run)
 請確認：
 - `votes.db` 已存在
 - volume 路徑正確
 - 容器內使用的資料庫路徑為 `/app/votes.db
 
-### 2. 外部 IP 無法存取
+### 2. 外部 IP 無法存取(http v.s. https)
 請確認：
 - 容器已啟動
 - GCP 防火牆已開放 `tcp:80`
