@@ -1,4 +1,4 @@
-name: Deploy to GCP VM
+name: deploy
 
 on:
   push:
@@ -16,17 +16,19 @@ jobs:
       - name: Setup SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.GCP_VM_SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.GCP_VM_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.GCP_VM_HOST }} >> ~/.ssh/known_hosts
 
       - name: Deploy on GCP VM
         run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }} << 'EOF'
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }} << EOF
             set -e
             cd ${{ secrets.GCP_APP_DIR }}
             git pull origin main
-            docker compose down
+
+            docker rm -f my-vote-app || true
             docker compose up -d --build
+
             docker ps
           EOF
