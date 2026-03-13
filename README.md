@@ -149,6 +149,8 @@ http://<VM_EXTERNAL_IP>
 ### 3. `docker-compose: command not found`
 請確認已安裝 Docker Compose plugin：
 ```bash
+sudo apt-get update
+sudo apt-get install -y docker-compose-plugin
 docker compose version
 ```
 
