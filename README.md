@@ -169,14 +169,6 @@ docker rm -f my-vote-app 2>/dev/null || true
 docker rm -f my-app-container 2>/dev/null || true
 ```
 
-## 後續優化方向
-- 健康檢查
-- HTTPS / SSL
-- `.dockerignore`
-- SQLite 備份機制
-- Registry-based deployment
-- 監控與告警
-
 ## 部署成果描述
 本專案完成：
 - Docker 容器化
@@ -185,4 +177,10 @@ docker rm -f my-app-container 2>/dev/null || true
 - GitHub Actions 自動部署
 - 基礎 CI/CD 實作
 
-可作為雲端部署、Docker、GitHub Actions 與 DevOps 入門專案。
+## 後續優化方向
+- 健康檢查
+- HTTPS / SSL
+- `.dockerignore`
+- SQLite 備份機制
+- Registry-based deployment
+- 監控與告警
