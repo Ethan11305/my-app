@@ -1,0 +1,9 @@
+services:
+  vote-app:
+    build: .
+    container_name: my-vote-app
+    ports:
+      - "80:3000"
+    volumes:
+      - ./votes.db:/app/votes.db
+    restart: always
