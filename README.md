@@ -180,7 +180,6 @@ docker rm -f my-app-container 2>/dev/null || true
 ## 後續優化方向
 - 健康檢查
 - HTTPS / SSL
-- `.dockerignore`
 - SQLite 備份機制
 - Registry-based deployment
-- 監控與告警
+- 監控與警告
