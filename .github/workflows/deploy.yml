@@ -1,34 +1,141 @@
-name: deploy
+name: Deploy
+
+# 觸發條件：CI workflow 在 main 上跑成功 → 自動部署該 commit 對應的 image。
+# 重點：deploy 只負責「拉 image + 切換容器 + 健檢 + 失敗 rollback」，不再 build。
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:        # 也允許手動部署
+    inputs:
+      sha:
+        description: '要部署的 commit SHA（預設用 main 最新）'
+        required: false
+
+permissions:
+  contents: read
+  id-token: write           # WIF 認證 GCP
 
 jobs:
   deploy:
+    # 只在 CI 成功時跑（手動觸發也允許）
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha || github.sha }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout (the deployed commit)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
 
-      - name: Setup SSH key
+      - name: Compute image ref
+        id: img
+        env:
+          REGION:     ${{ vars.GCP_REGION }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          AR_REPO:    ${{ vars.GCP_AR_REPO }}
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/my-app:${DEPLOY_SHA}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # ---------- SSH 設定（用 ssh-agent，不寫私鑰到檔案）----------
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GCP_VM_SSH_KEY }}
+
+      - name: Add VM to known_hosts
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.GCP_VM_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.GCP_VM_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ secrets.GCP_VM_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Deploy on GCP VM
+      # ---------- 上傳新版 compose file 到 VM ----------
+      - name: Copy compose file to VM
         run: |
-          ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519 ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }} << EOF
-            set -e
-            cd ${{ secrets.GCP_APP_DIR }}
-            git pull origin main
+          scp docker-compose.prod.yml \
+            "${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }}:${{ secrets.GCP_APP_DIR }}/docker-compose.yml"
 
-            docker rm -f my-vote-app || true
-            docker compose up -d --build
+      # ---------- VM 端：拉 image、保存上一版、切換 ----------
+      - name: Deploy on VM (preserve previous tag for rollback)
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          REGION: ${{ vars.GCP_REGION }}
+        run: |
+          ssh "${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }}" \
+              IMAGE="$IMAGE" REGION="$REGION" APP_DIR="${{ secrets.GCP_APP_DIR }}" \
+              bash -se <<'REMOTE'
+            set -euo pipefail
+            cd "$APP_DIR"
 
-            docker ps
-          EOF
+            # 1) 留存上一版 .env 作為 rollback 依據
+            if [ -f .env ]; then
+              cp .env .env.prev
+            fi
+
+            # 2) 認證 + 拉新 image
+            gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+            docker pull "$IMAGE"
+
+            # 3) 寫入新 IMAGE 給 compose 讀
+            echo "IMAGE=$IMAGE" > .env
+
+            # 4) 啟動新版（compose v2）
+            docker compose up -d --remove-orphans
+            docker compose ps
+          REMOTE
+
+      # ---------- 健檢（10 次重試，每次 5 秒）----------
+      - name: Health check
+        id: health
+        run: |
+          set +e
+          for i in $(seq 1 10); do
+            CODE=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 \
+                    "http://${{ secrets.GCP_VM_HOST }}/" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "Healthy on attempt $i (HTTP $CODE)"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP=$CODE — retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::Health check failed after 10 attempts"
+          exit 1
+
+      # ---------- 失敗時自動 rollback ----------
+      - name: Rollback to previous image
+        if: failure() && steps.health.conclusion == 'failure'
+        run: |
+          ssh "${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }}" \
+              APP_DIR="${{ secrets.GCP_APP_DIR }}" \
+              bash -se <<'REMOTE'
+            set -euo pipefail
+            cd "$APP_DIR"
+            if [ ! -f .env.prev ]; then
+              echo "::error::No .env.prev found — manual intervention required"
+              exit 1
+            fi
+            echo "Rolling back..."
+            cp .env.prev .env
+            docker compose up -d
+            docker compose ps
+          REMOTE
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Deploy"
+            echo ""
+            echo "- Commit: \`${DEPLOY_SHA}\`"
+            echo "- Image:  \`${{ steps.img.outputs.image }}\`"
+            echo "- Health: ${{ steps.health.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"
