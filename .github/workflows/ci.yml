@@ -1,0 +1,194 @@
+name: CI
+
+# Stage 流程：lint → test → secret scan → SCA → Trivy fs → build → Trivy image → push
+# Push 到 Artifact Registry 只在 main 分支且所有掃描通過後才執行。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # 上傳 SARIF 到 GitHub Security tab
+  id-token: write          # 給 GCP Workload Identity Federation 用
+  pull-requests: read
+
+env:
+  IMAGE_NAME: my-app
+  NODE_VERSION: '20'
+
+jobs:
+  # -------------------------------------------------------------------
+  # Stage 1: Lint & Type check
+  # -------------------------------------------------------------------
+  lint-test:
+    name: Lint & Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install deps
+        run: npm ci
+
+      - name: TypeScript type check
+        run: npm run lint
+
+      # TODO: 補完 unit test 後打開
+      # - name: Run unit tests
+      #   run: npm test
+
+  # -------------------------------------------------------------------
+  # Stage 2: Secret scan（gitleaks 掃整個 git history）
+  # -------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks 要看完整歷史
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # -------------------------------------------------------------------
+  # Stage 3: SCA（依賴漏洞）
+  # -------------------------------------------------------------------
+  sca-audit:
+    name: SCA (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      - run: npm ci
+      - name: npm audit (block on high+)
+        run: npm audit --audit-level=high --omit=dev
+
+  # -------------------------------------------------------------------
+  # Stage 4: Trivy filesystem & config scan
+  #   一次掃：依賴漏洞 / IaC misconfig（含 Dockerfile）/ secret
+  # -------------------------------------------------------------------
+  trivy-fs:
+    name: Trivy fs scan (vuln + config + secret)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy fs scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+          format: sarif
+          output: trivy-fs.sarif
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy fs SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # -------------------------------------------------------------------
+  # Stage 5+6: Build → Trivy image scan → Push (main only)
+  # -------------------------------------------------------------------
+  build-scan-push:
+    name: Build, scan & push image
+    runs-on: ubuntu-latest
+    needs: [lint-test, secret-scan, sca-audit, trivy-fs]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag:   ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image meta
+        id: meta
+        env:
+          REGION:     ${{ vars.GCP_REGION }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          AR_REPO:    ${{ vars.GCP_AR_REPO }}
+        run: |
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPO}/${IMAGE_NAME}"
+          TAG="${GITHUB_SHA}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "Image will be: $IMAGE:$TAG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (load locally, NOT pushing yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Trivy image scan (block on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref:      ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+          severity:       CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type:      os,library
+          exit-code:      '1'
+          format:         sarif
+          output:         trivy-image.sarif
+          trivyignores:   .trivyignore
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category:   trivy-image
+
+      # ----- 通過全部掃描，認證 GCP 並 push -----
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account:            ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Push image (SHA + latest)
+        run: |
+          docker push "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}"
+          docker tag  "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}" \
+                      "${{ steps.meta.outputs.image }}:latest"
+          docker push "${{ steps.meta.outputs.image }}:latest"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Image pushed"
+            echo ""
+            echo "- \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}\`"
+            echo "- \`${{ steps.meta.outputs.image }}:latest\`"
+            echo ""
+            echo "Trivy 掃描結果已上傳到 Security tab。"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -4,3 +4,9 @@ dist
 .env
 *.log
 votes.db
+
+# Database files (added in DevSecOps refactor)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

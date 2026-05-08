@@ -1,0 +1,18 @@
+# =====================================================================
+# .trivyignore — Trivy 掃描例外清單
+# =====================================================================
+# 規則：每一筆例外都要有「原因 + 重檢日期（建議 90 天）」。
+# 不要直接把 severity 門檻調低 — 那是逃避不是治理。
+#
+# 格式：
+#   <CVE-ID>          # [reason] / [scope] / 重檢: YYYY-MM-DD
+#
+# 範例（請依實際掃描結果增刪，目前先留空）：
+# ----------------------------------------------------------------------
+# CVE-2024-21538       # cross-spawn ReDoS, 只在 dev tooling 用到, 不在 production code path. 重檢: 2026-08-01
+# CVE-2024-XXXXX       # debian base image upstream 未修, no fix available, 影響面在 libc 但無觸發路徑. 重檢: 2026-09-01
+# GHSA-aaaa-bbbb-cccc  # transitive dep, 升級需 major bump 同時改 API, 排入下個 sprint. 重檢: 2026-07-15
+#
+# ----------------------------------------------------------------------
+# 也可以針對 misconfig 規則 ID 例外（trivy config 用）：
+# AVD-DS-0002          # Dockerfile USER root — 已在 multi-stage 最後階段切到 non-root, 誤判. 重檢: 2026-12-01

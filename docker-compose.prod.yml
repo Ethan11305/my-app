@@ -1,0 +1,37 @@
+# Production compose file —— 由 deploy.yml 上傳到 VM 並改名為 docker-compose.yml
+#
+# 重點變更：
+#   * 不再 `build: .` —— 直接拉 Artifact Registry 的 image（由 ${IMAGE} 指定）
+#   * SQLite 改成掛載目錄（/opt/my-app/data），檔案層級的 mount 容易遇到權限問題
+#   * 加上 healthcheck（compose v2 會把它讀進 docker ps 狀態）
+#   * 限制 resource，避免 SQLite 失控吃滿 VM
+
+services:
+  vote-app:
+    image: ${IMAGE}                  # 由 deploy 步驟寫到 .env：IMAGE=<region>-docker.pkg.dev/.../my-app:<sha>
+    container_name: my-vote-app
+    restart: unless-stopped
+    ports:
+      - "80:3000"
+    volumes:
+      # 注意：host 端目錄需先存在且 owner = 1001:1001（對應 Dockerfile 裡的 app user）
+      #   sudo mkdir -p /opt/my-app/data
+      #   sudo chown -R 1001:1001 /opt/my-app/data
+      - /opt/my-app/data:/app/data
+    environment:
+      - NODE_ENV=production
+      # 若 server.ts 還寫死 ./votes.db，下面這行先不會生效；之後改成讀 DB_PATH 即可
+      - DB_PATH=/app/data/votes.db
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
